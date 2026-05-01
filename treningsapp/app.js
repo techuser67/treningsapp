@@ -1,11 +1,23 @@
-// Trening — personlig treningsapp (Preact + htm + localStorage)
+// Trening — personlig treningsapp (Preact + htm + Supabase)
 // Bygd som en single-file modul. Importer Preact og htm fra esm.sh.
 
 import { h, render, Fragment } from 'https://esm.sh/preact@10.22.0';
 import { useState, useEffect, useMemo, useRef, useCallback } from 'https://esm.sh/preact@10.22.0/hooks';
 import htm from 'https://esm.sh/htm@3.1.1';
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.46.1';
 
 const html = htm.bind(h);
+
+/* =========================================================
+   SUPABASE-KLIENT
+   ========================================================= */
+
+const SUPABASE_URL = 'https://pyhcfmycrttptmvwwxbz.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InB5aGNmbXljcnR0cHRtdnd3eGJ6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc2NzA2ODQsImV4cCI6MjA5MzI0NjY4NH0.ztNafvLscrlcJUio6AWFGYd4znja8mhIxIv49kIAbMo';
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+  auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false },
+});
 
 /* =========================================================
    DATALAGER  (localStorage med versjonering)
@@ -96,14 +108,103 @@ const completedSetCount = (workout) =>
   workout.exercises.reduce((n, ex) => n + ex.sets.filter(s => s.completed).length, 0);
 
 /* =========================================================
-   ROOT-STATE  (en enkel store)
+   AUTH-STATE  (Supabase)
    ========================================================= */
 
-function useStore() {
-  const [data, setData] = useState(loadData);
+function useAuth() {
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
 
-  // Persistér ved hver endring
-  useEffect(() => { saveData(data); }, [data]);
+  useEffect(() => {
+    let mounted = true;
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (!mounted) return;
+      setUser(session?.user ?? null);
+      setLoading(false);
+    });
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!mounted) return;
+      setUser(session?.user ?? null);
+    });
+    return () => { mounted = false; subscription.unsubscribe(); };
+  }, []);
+
+  const signOut = useCallback(async () => {
+    await supabase.auth.signOut();
+    // Tøm lokal cache så neste innlogging ikke arver gamle data
+    try { localStorage.removeItem(STORAGE_KEY); } catch {}
+  }, []);
+
+  return { user, loading, signOut };
+}
+
+/* =========================================================
+   ROOT-STATE  (synkroniseres med Supabase når innlogget)
+   ========================================================= */
+
+function useStore(user) {
+  const [data, setData] = useState(loadData);
+  const [synced, setSynced] = useState(false);
+  const userIdRef = useRef(null);
+  const saveTimerRef = useRef(null);
+
+  // Last fra sky når brukeren logger inn (eller bytter)
+  useEffect(() => {
+    if (!user) {
+      userIdRef.current = null;
+      setSynced(false);
+      return;
+    }
+    if (userIdRef.current === user.id) return; // allerede lastet
+    userIdRef.current = user.id;
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const { data: row, error } = await supabase
+          .from('user_data')
+          .select('data')
+          .eq('user_id', user.id)
+          .maybeSingle();
+        if (cancelled) return;
+        if (error) {
+          console.error('Kunne ikke laste data fra sky', error);
+          setSynced(true); // la appen kjøre med lokal data uansett
+          return;
+        }
+        if (row?.data && Object.keys(row.data).length > 0) {
+          // Sky har data — bruk det
+          const cloud = { ...DEFAULT_DATA(), ...row.data, settings: { ...DEFAULT_DATA().settings, ...(row.data.settings || {}) } };
+          setData(cloud);
+        }
+        // Hvis sky er tom, beholder vi lokal state. Den vil sync-es opp ved neste lagring.
+        setSynced(true);
+      } catch (e) {
+        console.error(e);
+        setSynced(true);
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [user?.id]);
+
+  // Lagre lokalt umiddelbart, og til sky med debounce
+  useEffect(() => {
+    saveData(data);
+    if (!user || !synced) return;
+    clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(async () => {
+      try {
+        const { error } = await supabase
+          .from('user_data')
+          .upsert({ user_id: user.id, data, updated_at: new Date().toISOString() }, { onConflict: 'user_id' });
+        if (error) console.error('Sky-lagring feilet', error);
+      } catch (e) {
+        console.error('Sky-lagring kastet feil', e);
+      }
+    }, 800);
+    return () => clearTimeout(saveTimerRef.current);
+  }, [data, user?.id, synced]);
 
   const update = useCallback((mutator) => {
     setData((d) => {
@@ -113,7 +214,7 @@ function useStore() {
     });
   }, []);
 
-  return [data, update, setData];
+  return [data, update, setData, synced];
 }
 
 /* =========================================================
@@ -1520,7 +1621,7 @@ function WorkoutDetailScreen({ data, update, navigate, params }) {
    SCREEN: INNSTILLINGER
    ========================================================= */
 
-function SettingsScreen({ data, update, setRawData }) {
+function SettingsScreen({ data, update, setRawData, user, signOut }) {
   const setSettings = (patch) => update(d => Object.assign(d.settings, patch));
   const fileInput = useRef(null);
 
@@ -1613,12 +1714,23 @@ function SettingsScreen({ data, update, setRawData }) {
           </div>
         <//>
 
+        ${user && html`
+          <${Card} className="p-4">
+            <div class="text-xs uppercase tracking-wide text-ink-400 font-medium mb-3">Konto</div>
+            <div class="text-sm text-ink-700 mb-3 break-all">${user.email}</div>
+            <${Button} variant="secondary" className="w-full" onClick=${signOut}>Logg ut<//>
+            <p class="text-xs text-ink-400 mt-3">
+              Dataene dine ligger trygt i skyen og synkroniseres mellom enheter du logger inn på.
+            </p>
+          <//>
+        `}
+
         <${Card} className="p-4 border-red-100">
           <div class="text-xs uppercase tracking-wide text-red-500 font-medium mb-2">Faresone</div>
           <${Button} variant="danger" className="w-full" onClick=${wipe}>Slett alle data<//>
         <//>
 
-        <div class="text-center text-xs text-ink-400 pt-4">Trening · v1.0</div>
+        <div class="text-center text-xs text-ink-400 pt-4">Trening · v1.1</div>
       </div>
     </div>
   `;
@@ -1656,15 +1768,155 @@ function BottomNav({ current, onChange }) {
 }
 
 /* =========================================================
+   LOGG INN-SKJERM (e-post + 6-sifret kode)
+   ========================================================= */
+
+function LoginScreen() {
+  const [email, setEmail] = useState('');
+  const [code, setCode] = useState('');
+  const [step, setStep] = useState('email'); // 'email' | 'code'
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [info, setInfo] = useState('');
+
+  const sendCode = async (e) => {
+    e?.preventDefault?.();
+    setError(''); setInfo(''); setBusy(true);
+    try {
+      const { error: err } = await supabase.auth.signInWithOtp({
+        email: email.trim().toLowerCase(),
+        options: { shouldCreateUser: false },
+      });
+      if (err) {
+        // Standardmelding når e-post ikke er på whitelisten:
+        if (/signups not allowed|user not found|Invalid login/i.test(err.message)) {
+          setError('Denne e-posten har ikke tilgang. Kontakt eier for å bli lagt til.');
+        } else {
+          setError(err.message);
+        }
+        return;
+      }
+      setStep('code');
+      setInfo(`En kode er sendt til ${email}. Sjekk innboksen (og spam).`);
+    } catch (e2) {
+      setError(e2.message || 'Noe gikk galt');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const verifyCode = async (e) => {
+    e?.preventDefault?.();
+    setError(''); setBusy(true);
+    try {
+      const { error: err } = await supabase.auth.verifyOtp({
+        email: email.trim().toLowerCase(),
+        token: code.trim(),
+        type: 'email',
+      });
+      if (err) {
+        setError('Feil eller utløpt kode. Be om en ny.');
+        return;
+      }
+      // Auth state-endringen i useAuth tar over fra her
+    } catch (e2) {
+      setError(e2.message || 'Noe gikk galt');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return html`
+    <div class="min-h-screen max-w-md mx-auto px-6 flex flex-col justify-center safe-top safe-bottom">
+      <div class="screen-enter">
+        <h1 class="text-3xl font-semibold tracking-tight mb-2">Trening</h1>
+        <p class="text-ink-500 mb-8">${step === 'email' ? 'Logg inn med e-post for å fortsette.' : 'Skriv inn koden du fikk på e-post.'}</p>
+
+        ${step === 'email' && html`
+          <form onSubmit=${sendCode} class="space-y-3">
+            <${Field} label="E-post">
+              <input
+                type="email"
+                inputMode="email"
+                autoComplete="email"
+                value=${email}
+                onInput=${(e) => setEmail(e.currentTarget.value)}
+                placeholder="din@epost.no"
+                class="w-full h-12 px-4 bg-ink-50 rounded-xl outline-none focus:bg-white focus:ring-1 focus:ring-ink-300"
+                required
+              />
+            <//>
+            <${Button} variant="primary" className="w-full" disabled=${busy || !email.includes('@')}>
+              ${busy ? 'Sender…' : 'Send kode'}
+            <//>
+          </form>
+        `}
+
+        ${step === 'code' && html`
+          <form onSubmit=${verifyCode} class="space-y-3">
+            <${Field} label="6-sifret kode">
+              <input
+                type="text"
+                inputMode="numeric"
+                autoComplete="one-time-code"
+                pattern="[0-9]*"
+                maxlength="6"
+                value=${code}
+                onInput=${(e) => setCode(e.currentTarget.value.replace(/\D/g, '').slice(0, 6))}
+                placeholder="••••••"
+                class="w-full h-14 px-4 text-center text-2xl tracking-[0.5em] big-num bg-ink-50 rounded-xl outline-none focus:bg-white focus:ring-1 focus:ring-ink-300"
+                required
+                autoFocus
+              />
+            <//>
+            <${Button} variant="primary" className="w-full" disabled=${busy || code.length !== 6}>
+              ${busy ? 'Sjekker…' : 'Logg inn'}
+            <//>
+            <button
+              type="button"
+              onClick=${() => { setStep('email'); setCode(''); setError(''); setInfo(''); }}
+              class="tap w-full h-10 text-sm text-ink-500"
+            >Bytt e-post</button>
+          </form>
+        `}
+
+        ${error && html`<div class="mt-4 p-3 rounded-lg bg-red-50 text-red-700 text-sm">${error}</div>`}
+        ${info && !error && html`<div class="mt-4 p-3 rounded-lg bg-ink-50 text-ink-600 text-sm">${info}</div>`}
+      </div>
+    </div>
+  `;
+}
+
+/* =========================================================
    APP
    ========================================================= */
 
 function App() {
-  const [data, update, setRawData] = useStore();
+  const { user, loading, signOut } = useAuth();
+  const [data, update, setRawData, synced] = useStore(user);
   const [route, setRoute] = useState({ name: 'hjem', params: {} });
   const navigate = (name, params = {}) => setRoute({ name, params });
 
-  // Hvis det er en aktiv økt og brukeren bytter til "logg"-fanen, bra. Ellers ingen redirect.
+  // Splash mens auth-status sjekkes
+  if (loading) {
+    return html`
+      <div class="min-h-screen flex items-center justify-center">
+        <div class="text-ink-400 text-sm">Laster…</div>
+      </div>
+    `;
+  }
+
+  // Ikke innlogget: vis login-skjerm
+  if (!user) return html`<${LoginScreen} />`;
+
+  // Innlogget men data ikke ferdig hentet: enkel splash
+  if (!synced) {
+    return html`
+      <div class="min-h-screen flex items-center justify-center">
+        <div class="text-ink-400 text-sm">Henter dataene dine…</div>
+      </div>
+    `;
+  }
 
   // Map fra fane-id til skjerm
   const renderRoute = () => {
@@ -1677,7 +1929,7 @@ function App() {
       case 'historikk':
       case 'historikk-detalj':
         return html`<${WorkoutDetailScreen} data=${data} update=${update} navigate=${navigate} params=${route.params} />`;
-      case 'innstillinger': return html`<${SettingsScreen} data=${data} update=${update} setRawData=${setRawData} />`;
+      case 'innstillinger': return html`<${SettingsScreen} data=${data} update=${update} setRawData=${setRawData} user=${user} signOut=${signOut} />`;
       default: return null;
     }
   };
