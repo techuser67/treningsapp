@@ -1,5 +1,5 @@
-// Enkel service worker for offline-støtte
-const CACHE = 'trening-v1';
+// Enkel service worker for offline-stÃ¸tte
+const CACHE = 'trening-v2';
 const APP_SHELL = [
   './',
   './index.html',
