@@ -47,3 +47,8 @@ input[type=number] { -moz-appearance: textfield; }
   backdrop-filter: blur(2px);
   -webkit-backdrop-filter: blur(2px);
 }
+
+/* Plasser et sticky element rett over BottomNav (60px innhold + safe-area-inset) */
+.above-bottom-nav {
+  bottom: calc(env(safe-area-inset-bottom, 0px) + 64px);
+}
