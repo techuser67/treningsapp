@@ -20,16 +20,25 @@ const DEFAULT_DATA = () => ({
   settings: {
     units: 'kg',
     restSeconds: 120,
-    showRIR: true,
+    showRPE: true,
   },
 });
+
+// Faste alternativer for justerbar hviletimer (sekunder)
+const REST_PICKER_OPTIONS = [15, 30, 45, 60, 75, 90, 120, 150, 180, 240, 300];
 
 function loadData() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return DEFAULT_DATA();
     const parsed = JSON.parse(raw);
-    return { ...DEFAULT_DATA(), ...parsed, settings: { ...DEFAULT_DATA().settings, ...(parsed.settings || {}) } };
+    const merged = { ...DEFAULT_DATA(), ...parsed, settings: { ...DEFAULT_DATA().settings, ...(parsed.settings || {}) } };
+    // Migrer gammel showRIR-setting til showRPE
+    if (parsed.settings && 'showRIR' in parsed.settings && !('showRPE' in parsed.settings)) {
+      merged.settings.showRPE = parsed.settings.showRIR;
+      delete merged.settings.showRIR;
+    }
+    return merged;
   } catch (e) {
     console.error('Failed to load data', e);
     return DEFAULT_DATA();
@@ -283,7 +292,7 @@ function HomeScreen({ data, update, navigate }) {
         programId: program.id,
         exercises: day.exercises.map(de => ({
           exerciseId: de.exerciseId,
-          sets: Array.from({ length: de.targetSets || 3 }, () => ({ weight: '', reps: '', rir: '', completed: false })),
+          sets: Array.from({ length: de.targetSets || 3 }, () => ({ weight: '', reps: '', rpe: '', completed: false })),
           notes: '',
           targetReps: de.targetReps,
         })),
@@ -480,7 +489,7 @@ function WorkoutScreen({ data, update, navigate }) {
       for (const id of exerciseIds) {
         d.activeWorkout.exercises.push({
           exerciseId: id,
-          sets: [{ weight: '', reps: '', rir: '', completed: false }],
+          sets: [{ weight: '', reps: '', rpe: '', completed: false }],
           notes: '',
         });
       }
@@ -494,7 +503,7 @@ function WorkoutScreen({ data, update, navigate }) {
     sets.push({
       weight: last?.weight ?? '',
       reps: last?.reps ?? '',
-      rir: '',
+      rpe: '',
       completed: false,
     });
   });
@@ -504,13 +513,30 @@ function WorkoutScreen({ data, update, navigate }) {
   const updateSet = (exIdx, setIdx, patch) => update((d) => {
     Object.assign(d.activeWorkout.exercises[exIdx].sets[setIdx], patch);
   });
-  const toggleSet = (exIdx, setIdx) => {
+  // Fullfør et sett og start hviletimer. customRest = sekunder (overstyrer standard).
+  const completeSet = (exIdx, setIdx, customRest) => {
     const s = aw.exercises[exIdx].sets[setIdx];
     const willComplete = !s.completed;
     update((d) => { d.activeWorkout.exercises[exIdx].sets[setIdx].completed = willComplete; });
-    if (willComplete && data.settings.restSeconds > 0) {
-      setRestTimer({ endsAt: Date.now() + data.settings.restSeconds * 1000 });
+    if (willComplete) {
+      const restSec = customRest != null ? customRest : data.settings.restSeconds;
+      if (restSec > 0) {
+        setRestTimer({ endsAt: Date.now() + restSec * 1000, total: restSec });
+      }
+    } else {
+      // Hvis brukeren slår av et sett, stopp evt. pågående hvile
+      setRestTimer(null);
     }
+  };
+
+  // Hviletimer-velger: holder styr på hvilket sett som skal fullføres med valgt tid
+  const [restPicker, setRestPicker] = useState(null); // { exIdx, setIdx } | null
+  const openRestPicker = (exIdx, setIdx) => setRestPicker({ exIdx, setIdx });
+  const pickRestTime = (sec) => {
+    if (!restPicker) return;
+    const { exIdx, setIdx } = restPicker;
+    setRestPicker(null);
+    completeSet(exIdx, setIdx, sec);
   };
 
   const finish = () => {
@@ -544,13 +570,13 @@ function WorkoutScreen({ data, update, navigate }) {
   };
 
   return html`
-    <div class="screen-enter pb-32">
+    <div class="screen-enter pb-44">
       <div class="px-5 pt-6 pb-4 flex items-center justify-between">
         <${IconButton} onClick=${cancel}>
           <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
         <//>
-        <${LiveTimer} since=${aw.startedAt} />
-        <${Button} size="sm" onClick=${finish}>Fullfør</${Button}>
+        <div class="text-xs uppercase tracking-wide text-ink-400 font-medium">Aktiv økt</div>
+        <div class="w-9"></div>
       </div>
 
       <div class="px-5 mb-5">
@@ -562,7 +588,7 @@ function WorkoutScreen({ data, update, navigate }) {
         />
       </div>
 
-      ${restTimer && html`<${RestBanner} endsAt=${restTimer.endsAt} onDone=${() => setRestTimer(null)} onCancel=${() => setRestTimer(null)} />`}
+      ${restTimer && html`<${RestBanner} endsAt=${restTimer.endsAt} total=${restTimer.total} onDone=${() => setRestTimer(null)} onCancel=${() => setRestTimer(null)} />`}
 
       <div class="px-5 space-y-4">
         ${aw.exercises.map((ex, exIdx) => {
@@ -573,10 +599,12 @@ function WorkoutScreen({ data, update, navigate }) {
               exercise=${exercise}
               exData=${ex}
               units=${data.settings.units}
-              showRIR=${data.settings.showRIR}
+              showRPE=${data.settings.showRPE}
               previousBest=${getPreviousBest(data.workouts, ex.exerciseId)}
+              previousSets=${getPreviousSets(data.workouts, ex.exerciseId)}
               onSetChange=${(setIdx, patch) => updateSet(exIdx, setIdx, patch)}
-              onToggleSet=${(setIdx) => toggleSet(exIdx, setIdx)}
+              onCompleteSet=${(setIdx) => completeSet(exIdx, setIdx)}
+              onPickRest=${(setIdx) => openRestPicker(exIdx, setIdx)}
               onAddSet=${() => addSet(exIdx)}
               onRemoveSet=${(setIdx) => removeSet(exIdx, setIdx)}
               onRemove=${() => removeExercise(exIdx)}
@@ -605,6 +633,23 @@ function WorkoutScreen({ data, update, navigate }) {
           return newId;
         }}
       />
+
+      <${RestPickerModal}
+        open=${!!restPicker}
+        onClose=${() => setRestPicker(null)}
+        onPick=${pickRestTime}
+      />
+
+      <!-- Sticky Fullfør-knapp: alltid synlig over BottomNav -->
+      <div class="fixed inset-x-0 above-bottom-nav z-20 pointer-events-none">
+        <div class="max-w-md mx-auto px-5 pb-2 pointer-events-auto">
+          <${Button}
+            variant="primary"
+            className="w-full shadow-lg shadow-ink-900/20"
+            onClick=${finish}
+          >Fullfør økt<//>
+        </div>
+      </div>
     </div>
   `;
 }
@@ -623,7 +668,20 @@ function getPreviousBest(workouts, exerciseId) {
   return null;
 }
 
-function ExerciseBlock({ exercise, exData, units, showRIR, previousBest, onSetChange, onToggleSet, onAddSet, onRemoveSet, onRemove }) {
+// Settene fra forrige gjennomførte økt med denne øvelsen.
+// Returnerer en array (samme rekkefølge som forrige gang) eller [] hvis ingen historikk.
+function getPreviousSets(workouts, exerciseId) {
+  const sorted = [...workouts].sort((a, b) => b.date - a.date);
+  for (const w of sorted) {
+    const ex = w.exercises.find(e => e.exerciseId === exerciseId);
+    if (ex && ex.sets.some(s => s.completed && s.weight && s.reps)) {
+      return ex.sets.filter(s => s.completed && s.weight && s.reps);
+    }
+  }
+  return [];
+}
+
+function ExerciseBlock({ exercise, exData, units, showRPE, previousBest, previousSets, onSetChange, onCompleteSet, onPickRest, onAddSet, onRemoveSet, onRemove }) {
   if (!exercise) {
     return html`
       <${Card} className="p-4">
@@ -650,10 +708,10 @@ function ExerciseBlock({ exercise, exData, units, showRIR, previousBest, onSetCh
 
       <div class="grid grid-cols-12 gap-2 text-[10px] uppercase tracking-wide text-ink-400 px-2 mb-1">
         <div class="col-span-1">#</div>
-        <div class="col-span-4">Vekt (${units})</div>
+        <div class=${showRPE ? 'col-span-3' : 'col-span-4'}>Vekt (${units})</div>
         <div class="col-span-3">Reps</div>
-        ${showRIR && html`<div class="col-span-2">RIR</div>`}
-        <div class=${cx(showRIR ? 'col-span-2' : 'col-span-4', 'text-right')}>✓</div>
+        ${showRPE && html`<div class="col-span-2">RPE</div>`}
+        <div class="col-span-3 text-right">Hvil</div>
       </div>
 
       <div class="space-y-1.5">
@@ -662,9 +720,11 @@ function ExerciseBlock({ exercise, exData, units, showRIR, previousBest, onSetCh
             key=${i}
             num=${i + 1}
             set=${s}
-            showRIR=${showRIR}
+            previousSet=${previousSets ? previousSets[i] : null}
+            showRPE=${showRPE}
             onChange=${(patch) => onSetChange(i, patch)}
-            onToggle=${() => onToggleSet(i)}
+            onComplete=${() => onCompleteSet(i)}
+            onPickRest=${() => onPickRest(i)}
             onRemove=${() => onRemoveSet(i)}
           />
         `)}
@@ -677,68 +737,115 @@ function ExerciseBlock({ exercise, exData, units, showRIR, previousBest, onSetCh
   `;
 }
 
-function SetRow({ num, set, showRIR, onChange, onToggle, onRemove }) {
+function SetRow({ num, set, previousSet, showRPE, onChange, onComplete, onPickRest, onRemove }) {
+  const prevWeight = previousSet?.weight ?? '';
+  const prevReps = previousSet?.reps ?? '';
+  const prevRpe = previousSet?.rpe ?? '';
   return html`
-    <div class=${cx('grid grid-cols-12 gap-2 items-center px-1 py-1 rounded-lg', set.completed ? 'bg-emerald-50' : '')}>
+    <div class=${cx('grid grid-cols-12 gap-2 items-center px-1 py-1 rounded-lg', set.completed ? 'bg-ink-50' : '')}>
       <div class="col-span-1 text-sm text-ink-500 text-center">${num}</div>
-      <div class="col-span-4">
+      <div class=${showRPE ? 'col-span-3' : 'col-span-4'}>
         <input
           type="number" inputMode="decimal" step="any"
           value=${set.weight}
+          placeholder=${prevWeight !== '' ? String(prevWeight) : ''}
           onInput=${(e) => onChange({ weight: e.currentTarget.value === '' ? '' : parseFloat(e.currentTarget.value) })}
-          class="w-full h-10 px-2 text-center bg-ink-50 rounded-lg outline-none focus:bg-white focus:ring-1 focus:ring-ink-300 big-num"
+          class="w-full h-10 px-2 text-center bg-ink-50 rounded-lg outline-none focus:bg-white focus:ring-1 focus:ring-ink-300 big-num placeholder:text-ink-300 placeholder:font-normal"
         />
       </div>
       <div class="col-span-3">
         <input
           type="number" inputMode="numeric"
           value=${set.reps}
+          placeholder=${prevReps !== '' ? String(prevReps) : ''}
           onInput=${(e) => onChange({ reps: e.currentTarget.value === '' ? '' : parseInt(e.currentTarget.value) })}
-          class="w-full h-10 px-2 text-center bg-ink-50 rounded-lg outline-none focus:bg-white focus:ring-1 focus:ring-ink-300 big-num"
+          class="w-full h-10 px-2 text-center bg-ink-50 rounded-lg outline-none focus:bg-white focus:ring-1 focus:ring-ink-300 big-num placeholder:text-ink-300 placeholder:font-normal"
         />
       </div>
-      ${showRIR && html`
+      ${showRPE && html`
         <div class="col-span-2">
           <input
-            type="number" inputMode="numeric"
-            value=${set.rir}
-            onInput=${(e) => onChange({ rir: e.currentTarget.value === '' ? '' : parseInt(e.currentTarget.value) })}
-            class="w-full h-10 px-2 text-center bg-ink-50 rounded-lg outline-none focus:bg-white focus:ring-1 focus:ring-ink-300 big-num"
+            type="number" inputMode="decimal" step="0.5" min="1" max="10"
+            value=${set.rpe}
+            placeholder=${prevRpe !== '' ? String(prevRpe) : ''}
+            onInput=${(e) => onChange({ rpe: e.currentTarget.value === '' ? '' : parseFloat(e.currentTarget.value) })}
+            class="w-full h-10 px-2 text-center bg-ink-50 rounded-lg outline-none focus:bg-white focus:ring-1 focus:ring-ink-300 big-num placeholder:text-ink-300 placeholder:font-normal"
           />
         </div>
       `}
-      <div class=${cx(showRIR ? 'col-span-2' : 'col-span-4', 'flex items-center justify-end gap-1')}>
+      <div class="col-span-3 flex items-center justify-end gap-1">
+        <!-- Justeringsknapp: åpner velger for spesifikk hviletid -->
         <button
-          onClick=${onToggle}
-          class=${cx('tap w-9 h-9 rounded-lg flex items-center justify-center', set.completed ? 'bg-emerald-600 text-white' : 'bg-ink-100 text-ink-400')}
+          onClick=${onPickRest}
+          aria-label="Velg hviletid"
+          class="tap w-9 h-9 rounded-lg flex items-center justify-center bg-ink-100 text-ink-500 active:bg-ink-200"
         >
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 5 5L20 7"/></svg>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h12M4 12h8M4 18h16M18 4v4M14 10v4M20 16v4"/></svg>
+        </button>
+        <!-- Hovedknapp: fullfør sett + start standard hvile -->
+        <button
+          onClick=${onComplete}
+          aria-label=${set.completed ? 'Angre fullført' : 'Fullfør sett og start hvile'}
+          class=${cx('tap w-9 h-9 rounded-lg flex items-center justify-center', set.completed ? 'bg-ink-900 text-white' : 'bg-ink-100 text-ink-500 active:bg-ink-200')}
+        >
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="13" r="8"/>
+            <path d="M12 9v4l2.5 2.5"/>
+            <path d="M9 2h6"/>
+            <path d="M19 5l1.5 1.5"/>
+          </svg>
         </button>
       </div>
     </div>
   `;
 }
 
-function RestBanner({ endsAt, onDone, onCancel }) {
+/* Modal for å velge spesifikk hviletid (15 sek – 5 min) før et sett fullføres. */
+function RestPickerModal({ open, onClose, onPick }) {
+  if (!open) return null;
+  const fmt = (s) => s < 60 ? `${s}s` : (s % 60 === 0 ? `${s/60}m` : `${Math.floor(s/60)}m ${s%60}s`);
+  return html`
+    <${Modal} open=${open} onClose=${onClose} title="Velg hviletid">
+      <div class="grid grid-cols-3 gap-2 p-1">
+        ${REST_PICKER_OPTIONS.map(sec => html`
+          <button
+            onClick=${() => onPick(sec)}
+            class="tap h-14 rounded-xl bg-ink-50 active:bg-ink-100 flex items-center justify-center font-medium big-num"
+          >${fmt(sec)}</button>
+        `)}
+      </div>
+      <p class="text-xs text-ink-400 mt-3 text-center">Settet markeres som fullført når du velger en tid.</p>
+    <//>
+  `;
+}
+
+function RestBanner({ endsAt, total, onDone, onCancel }) {
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), 250);
     return () => clearInterval(id);
   }, []);
   const remaining = Math.max(0, Math.ceil((endsAt - now) / 1000));
+  const pct = total ? Math.max(0, Math.min(100, ((total - remaining) / total) * 100)) : 0;
   useEffect(() => {
     if (remaining === 0) {
       try { navigator.vibrate?.([200, 80, 200]); } catch {}
       onDone();
     }
   }, [remaining]);
+  const fmt = (s) => s < 60 ? `${s}s` : `${Math.floor(s/60)}:${(s%60).toString().padStart(2,'0')}`;
   return html`
-    <div class="sticky top-0 z-10 mx-5 mb-4 rounded-2xl bg-ink-900 text-white px-4 py-3 flex items-center justify-between">
-      <div>
-        <div class="text-xs text-ink-300 uppercase tracking-wide">Hvil</div>
-        <div class="big-num text-2xl font-semibold">${remaining}s</div>
+    <div class="sticky top-2 z-10 mx-5 mb-4 rounded-2xl bg-ink-900 text-white px-4 py-3 overflow-hidden">
+      <div class="flex items-center justify-between">
+        <div>
+          <div class="text-xs text-ink-300 uppercase tracking-wide">Hvil</div>
+          <div class="big-num text-2xl font-semibold tabular-nums">${fmt(remaining)}</div>
+        </div>
+        <button onClick=${onCancel} class="tap text-sm text-ink-300 px-3 py-1">Hopp over</button>
       </div>
-      <button onClick=${onCancel} class="tap text-sm text-ink-300 px-3 py-1">Hopp over</button>
+      ${total && html`
+        <div class="absolute left-0 bottom-0 h-1 bg-white/40 transition-all" style=${`width:${pct}%`}></div>
+      `}
     </div>
   `;
 }
@@ -1396,6 +1503,7 @@ function WorkoutDetailScreen({ data, update, navigate, params }) {
                   <div class="flex items-center gap-3 text-sm py-1">
                     <span class="w-6 text-ink-400">${i + 1}</span>
                     <span class="big-num">${s.weight}${data.settings.units} × ${s.reps}</span>
+                    ${s.rpe !== '' && s.rpe !== undefined && html`<span class="text-xs text-ink-400">RPE ${s.rpe}</span>`}
                     ${s.rir !== '' && s.rir !== undefined && html`<span class="text-xs text-ink-400">RIR ${s.rir}</span>`}
                   </div>
                 `)}
@@ -1465,13 +1573,13 @@ function SettingsScreen({ data, update, setRawData }) {
           <${Field} label="Standard hviletid (sekunder)">
             <${Input} type="number" inputMode="numeric" value=${data.settings.restSeconds} onInput=${(v) => setSettings({ restSeconds: parseInt(v) || 0 })} />
           <//>
-          <${Field} label="Vis RIR (Reps i Reserve)">
+          <${Field} label="Vis RPE (Rate of Perceived Exertion, 1–10)">
             <div class="flex gap-1 bg-ink-100 rounded-xl p-1">
               ${[[true, 'På'], [false, 'Av']].map(([v, l]) => html`
                 <button
-                  onClick=${() => setSettings({ showRIR: v })}
+                  onClick=${() => setSettings({ showRPE: v })}
                   class=${cx('tap flex-1 h-9 rounded-lg text-sm font-medium',
-                    data.settings.showRIR === v ? 'bg-white shadow-sm' : 'text-ink-500')}
+                    data.settings.showRPE === v ? 'bg-white shadow-sm' : 'text-ink-500')}
                 >${l}</button>
               `)}
             </div>
