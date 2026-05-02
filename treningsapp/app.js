@@ -1846,7 +1846,7 @@ function LoginScreen() {
                 required
               />
             <//>
-            <${Button} variant="primary" className="w-full" disabled=${busy || !email.includes('@')}>
+            <${Button} type="submit" variant="primary" className="w-full" onClick=${sendCode} disabled=${busy || !email.includes('@')}>
               ${busy ? 'Sender…' : 'Send kode'}
             <//>
           </form>
@@ -1869,7 +1869,7 @@ function LoginScreen() {
                 autoFocus
               />
             <//>
-            <${Button} variant="primary" className="w-full" disabled=${busy || code.length !== 6}>
+            <${Button} type="submit" variant="primary" className="w-full" onClick=${verifyCode} disabled=${busy || code.length !== 6}>
               ${busy ? 'Sjekker…' : 'Logg inn'}
             <//>
             <button
