@@ -1854,22 +1854,22 @@ function LoginScreen() {
 
         ${step === 'code' && html`
           <form onSubmit=${verifyCode} class="space-y-3">
-            <${Field} label="6-sifret kode">
+            <${Field} label="Engangskode fra e-post">
               <input
                 type="text"
                 inputMode="numeric"
                 autoComplete="one-time-code"
                 pattern="[0-9]*"
-                maxlength="6"
+                maxlength="8"
                 value=${code}
-                onInput=${(e) => setCode(e.currentTarget.value.replace(/\D/g, '').slice(0, 6))}
-                placeholder="••••••"
-                class="w-full h-14 px-4 text-center text-2xl tracking-[0.5em] big-num bg-ink-50 rounded-xl outline-none focus:bg-white focus:ring-1 focus:ring-ink-300"
+                onInput=${(e) => setCode(e.currentTarget.value.replace(/\D/g, '').slice(0, 8))}
+                placeholder="••••••••"
+                class="w-full h-14 px-4 text-center text-2xl tracking-[0.4em] big-num bg-ink-50 rounded-xl outline-none focus:bg-white focus:ring-1 focus:ring-ink-300"
                 required
                 autoFocus
               />
             <//>
-            <${Button} type="submit" variant="primary" className="w-full" onClick=${verifyCode} disabled=${busy || code.length !== 6}>
+            <${Button} type="submit" variant="primary" className="w-full" onClick=${verifyCode} disabled=${busy || code.length < 6}>
               ${busy ? 'Sjekker…' : 'Logg inn'}
             <//>
             <button
