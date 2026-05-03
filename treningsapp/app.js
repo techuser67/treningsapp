@@ -1768,36 +1768,57 @@ function BottomNav({ current, onChange }) {
 }
 
 /* =========================================================
-   LOGG INN-SKJERM (e-post + 6-sifret kode)
+   LOGG INN-SKJERM (e-post + passord, med whitelist på signup)
    ========================================================= */
 
 function LoginScreen() {
+  const [mode, setMode] = useState('signin'); // 'signin' | 'signup'
   const [email, setEmail] = useState('');
-  const [code, setCode] = useState('');
-  const [step, setStep] = useState('email'); // 'email' | 'code'
+  const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [info, setInfo] = useState('');
 
-  const sendCode = async (e) => {
+  const cleanEmail = email.trim().toLowerCase();
+  const validForm = cleanEmail.includes('@') && password.length >= 6;
+
+  const submit = async (e) => {
     e?.preventDefault?.();
     setError(''); setInfo(''); setBusy(true);
     try {
-      const { error: err } = await supabase.auth.signInWithOtp({
-        email: email.trim().toLowerCase(),
-        options: { shouldCreateUser: false },
-      });
-      if (err) {
-        // Standardmelding når e-post ikke er på whitelisten:
-        if (/signups not allowed|user not found|Invalid login/i.test(err.message)) {
-          setError('Denne e-posten har ikke tilgang. Kontakt eier for å bli lagt til.');
-        } else {
-          setError(err.message);
+      if (mode === 'signin') {
+        const { error: err } = await supabase.auth.signInWithPassword({
+          email: cleanEmail,
+          password,
+        });
+        if (err) {
+          if (/Invalid login|Invalid credentials/i.test(err.message)) {
+            setError('Feil e-post eller passord.');
+          } else {
+            setError(err.message);
+          }
+          return;
         }
-        return;
+        // Auth state-endringen i useAuth tar over fra her
+      } else {
+        const { error: err } = await supabase.auth.signUp({
+          email: cleanEmail,
+          password,
+        });
+        if (err) {
+          if (/whitelist|not on the whitelist|42501/i.test(err.message)) {
+            setError('E-posten din er ikke godkjent for denne appen. Kontakt eier for tilgang.');
+          } else if (/already registered|User already/i.test(err.message)) {
+            setError('Denne e-posten har allerede en konto. Bytt til "Logg inn".');
+          } else if (/password/i.test(err.message)) {
+            setError('Passordet er for kort. Bruk minst 6 tegn.');
+          } else {
+            setError(err.message);
+          }
+          return;
+        }
+        // Med e-postbekreftelse av, logges du automatisk inn ved signup
       }
-      setStep('code');
-      setInfo(`En kode er sendt til ${email}. Sjekk innboksen (og spam).`);
     } catch (e2) {
       setError(e2.message || 'Noe gikk galt');
     } finally {
@@ -1805,83 +1826,70 @@ function LoginScreen() {
     }
   };
 
-  const verifyCode = async (e) => {
-    e?.preventDefault?.();
-    setError(''); setBusy(true);
-    try {
-      const { error: err } = await supabase.auth.verifyOtp({
-        email: email.trim().toLowerCase(),
-        token: code.trim(),
-        type: 'email',
-      });
-      if (err) {
-        setError('Feil eller utløpt kode. Be om en ny.');
-        return;
-      }
-      // Auth state-endringen i useAuth tar over fra her
-    } catch (e2) {
-      setError(e2.message || 'Noe gikk galt');
-    } finally {
-      setBusy(false);
-    }
+  const switchMode = (m) => {
+    setMode(m); setError(''); setInfo('');
   };
 
   return html`
     <div class="min-h-screen max-w-md mx-auto px-6 flex flex-col justify-center safe-top safe-bottom">
       <div class="screen-enter">
         <h1 class="text-3xl font-semibold tracking-tight mb-2">Trening</h1>
-        <p class="text-ink-500 mb-8">${step === 'email' ? 'Logg inn med e-post for å fortsette.' : 'Skriv inn koden du fikk på e-post.'}</p>
+        <p class="text-ink-500 mb-6">${mode === 'signin' ? 'Logg inn for å fortsette.' : 'Lag konto for å komme i gang.'}</p>
 
-        ${step === 'email' && html`
-          <form onSubmit=${sendCode} class="space-y-3">
-            <${Field} label="E-post">
-              <input
-                type="email"
-                inputMode="email"
-                autoComplete="email"
-                value=${email}
-                onInput=${(e) => setEmail(e.currentTarget.value)}
-                placeholder="din@epost.no"
-                class="w-full h-12 px-4 bg-ink-50 rounded-xl outline-none focus:bg-white focus:ring-1 focus:ring-ink-300"
-                required
-              />
-            <//>
-            <${Button} type="submit" variant="primary" className="w-full" onClick=${sendCode} disabled=${busy || !email.includes('@')}>
-              ${busy ? 'Sender…' : 'Send kode'}
-            <//>
-          </form>
-        `}
+        <!-- Faner -->
+        <div class="flex gap-1 bg-ink-100 rounded-xl p-1 mb-5">
+          <button
+            type="button"
+            onClick=${() => switchMode('signin')}
+            class=${cx('tap flex-1 h-10 rounded-lg text-sm font-medium',
+              mode === 'signin' ? 'bg-white shadow-sm' : 'text-ink-500')}
+          >Logg inn</button>
+          <button
+            type="button"
+            onClick=${() => switchMode('signup')}
+            class=${cx('tap flex-1 h-10 rounded-lg text-sm font-medium',
+              mode === 'signup' ? 'bg-white shadow-sm' : 'text-ink-500')}
+          >Lag konto</button>
+        </div>
 
-        ${step === 'code' && html`
-          <form onSubmit=${verifyCode} class="space-y-3">
-            <${Field} label="Engangskode fra e-post">
-              <input
-                type="text"
-                inputMode="numeric"
-                autoComplete="one-time-code"
-                pattern="[0-9]*"
-                maxlength="8"
-                value=${code}
-                onInput=${(e) => setCode(e.currentTarget.value.replace(/\D/g, '').slice(0, 8))}
-                placeholder="••••••••"
-                class="w-full h-14 px-4 text-center text-2xl tracking-[0.4em] big-num bg-ink-50 rounded-xl outline-none focus:bg-white focus:ring-1 focus:ring-ink-300"
-                required
-                autoFocus
-              />
-            <//>
-            <${Button} type="submit" variant="primary" className="w-full" onClick=${verifyCode} disabled=${busy || code.length < 6}>
-              ${busy ? 'Sjekker…' : 'Logg inn'}
-            <//>
-            <button
-              type="button"
-              onClick=${() => { setStep('email'); setCode(''); setError(''); setInfo(''); }}
-              class="tap w-full h-10 text-sm text-ink-500"
-            >Bytt e-post</button>
-          </form>
-        `}
+        <form onSubmit=${submit} class="space-y-3">
+          <${Field} label="E-post">
+            <input
+              type="email"
+              inputMode="email"
+              autoComplete="email"
+              value=${email}
+              onInput=${(e) => setEmail(e.currentTarget.value)}
+              placeholder="din@epost.no"
+              class="w-full h-12 px-4 bg-ink-50 rounded-xl outline-none focus:bg-white focus:ring-1 focus:ring-ink-300"
+              required
+            />
+          <//>
+          <${Field} label="Passord" hint=${mode === 'signup' ? 'Minst 6 tegn' : null}>
+            <input
+              type="password"
+              autoComplete=${mode === 'signin' ? 'current-password' : 'new-password'}
+              value=${password}
+              onInput=${(e) => setPassword(e.currentTarget.value)}
+              placeholder=${mode === 'signin' ? 'Ditt passord' : 'Velg et passord'}
+              class="w-full h-12 px-4 bg-ink-50 rounded-xl outline-none focus:bg-white focus:ring-1 focus:ring-ink-300"
+              required
+              minlength="6"
+            />
+          <//>
+          <${Button} type="submit" variant="primary" className="w-full" onClick=${submit} disabled=${busy || !validForm}>
+            ${busy ? 'Et øyeblikk…' : (mode === 'signin' ? 'Logg inn' : 'Lag konto')}
+          <//>
+        </form>
 
         ${error && html`<div class="mt-4 p-3 rounded-lg bg-red-50 text-red-700 text-sm">${error}</div>`}
         ${info && !error && html`<div class="mt-4 p-3 rounded-lg bg-ink-50 text-ink-600 text-sm">${info}</div>`}
+
+        <p class="mt-8 text-xs text-ink-400 text-center">
+          ${mode === 'signup'
+            ? 'Bare e-poster på eierens whitelist kan opprettes.'
+            : 'Glemt passord? Be eier om å resette.'}
+        </p>
       </div>
     </div>
   `;
