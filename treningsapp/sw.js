@@ -1,5 +1,5 @@
 // Enkel service worker for offline-stÃ¸tte
-const CACHE = 'trening-v8';
+const CACHE = 'trening-v9';
 const APP_SHELL = [
   './',
   './index.html',
@@ -59,12 +59,20 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // App shell: cache first, network fallback
-  event.respondWith(
-    caches.match(req).then((cached) => cached || fetch(req).then((res) => {
-      const copy = res.clone();
-      caches.open(CACHE).then((cache) => cache.put(req, copy)).catch(() => {});
-      return res;
-    }).catch(() => caches.match('./index.html')))
-  );
+  // App shell: NETWORK first, cache fallback (offline)
+  // Dette sikrer at oppdateringer dukker opp umiddelbart nÃ¥r du er online,
+  // mens appen fortsatt funker uten nett.
+  event.respondWith((async () => {
+    try {
+      const fresh = await fetch(req);
+      if (fresh.ok) {
+        const copy = fresh.clone();
+        caches.open(CACHE).then((cache) => cache.put(req, copy)).catch(() => {});
+      }
+      return fresh;
+    } catch {
+      const cached = await caches.match(req);
+      return cached || caches.match('./index.html');
+    }
+  })());
 });
