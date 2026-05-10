@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
-  <meta name="theme-color" content="#0a0a0a" />
+  <meta name="theme-color" content="#0a0a0c" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="Trening" />
@@ -21,29 +21,40 @@
             sans: ['-apple-system', 'BlinkMacSystemFont', 'Inter', 'system-ui', 'sans-serif'],
           },
           colors: {
+            // ink-skalaen er nå designet for mørk modus:
+            // lave tall = elevert overflate, høye tall = lys tekst
             ink: {
-              50: '#fafafa',
-              100: '#f4f4f5',
-              200: '#e4e4e7',
-              300: '#d4d4d8',
-              400: '#a1a1aa',
-              500: '#71717a',
-              600: '#52525b',
-              700: '#3f3f46',
-              800: '#27272a',
-              900: '#18181b',
-              950: '#09090b',
+              50:  '#15151a',  // subtil bg (set-rader, etc)
+              100: '#1c1c21',  // kort-overflate
+              200: '#27272f',  // border / segmentert kontroll bg
+              300: '#3f3f48',  // sterk border / disabled
+              400: '#71717a',  // muted tekst
+              500: '#a1a1aa',  // sekundær tekst
+              600: '#d4d4d8',  // body
+              700: '#e4e4e7',  // emfasert
+              800: '#f4f4f5',  // overskrifter
+              900: '#fafafa',  // primær tekst
+              950: '#ffffff',  // ren hvit
             },
+            // App-canvas (dypere enn kortene)
+            canvas: '#0a0a0c',
+            // Aksentfarge — sportslig lime
             accent: {
-              DEFAULT: '#0a0a0a',
+              DEFAULT: '#a3e635',
+              hover:   '#bef264',
+              fg:      '#0a0a0a',
             },
+          },
+          boxShadow: {
+            // Subtil opphevning på mørke kort
+            'card': '0 1px 0 0 rgba(255,255,255,0.04) inset, 0 1px 3px 0 rgba(0,0,0,0.5)',
           },
         },
       },
     };
   </script>
 </head>
-<body class="bg-white text-ink-900 antialiased">
+<body class="bg-canvas text-ink-900 antialiased">
   <div id="app"></div>
   <script type="module" src="app.js"></script>
   <script>
