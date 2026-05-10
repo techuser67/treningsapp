@@ -1,5 +1,5 @@
 // Enkel service worker for offline-stÃ¸tte
-const CACHE = 'trening-v6';
+const CACHE = 'trening-v8';
 const APP_SHELL = [
   './',
   './index.html',
@@ -21,6 +21,23 @@ self.addEventListener('activate', (event) => {
       Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k)))
     ).then(() => self.clients.claim())
   );
+});
+
+// NÃ¥r brukeren trykker pÃ¥ et hviletimer-varsel: fokuser eksisterende fane,
+// eller Ã¥pne appen hvis den er lukket.
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  event.waitUntil((async () => {
+    const allClients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    for (const client of allClients) {
+      if ('focus' in client) {
+        return client.focus();
+      }
+    }
+    if (self.clients.openWindow) {
+      return self.clients.openWindow('./');
+    }
+  })());
 });
 
 self.addEventListener('fetch', (event) => {
