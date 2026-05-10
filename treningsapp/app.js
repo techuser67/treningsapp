@@ -33,6 +33,9 @@ const DEFAULT_DATA = () => ({
     units: 'kg',
     restSeconds: 120,
     showRPE: true,
+    soundEnabled: true,         // Spill lyd når hviletimer er ute
+    notificationsEnabled: false,// Push-varsel når hviletimer er ute (krever tillatelse)
+    wakeLockEnabled: false,     // Hold skjerm våken under hvile
   },
 });
 
@@ -94,18 +97,122 @@ const startOfDay = (ts) => { const d = new Date(ts); d.setHours(0,0,0,0); return
 
 // Brzycki-formel for estimert 1RM
 const estimate1RM = (weight, reps) => {
-  if (!weight || !reps || reps < 1) return 0;
-  if (reps === 1) return weight;
-  return weight * (36 / (37 - reps));
+  const w = Number(weight);
+  const r = Number(reps);
+  if (!w || !r || r < 1) return 0;
+  if (r === 1) return w;
+  return w * (36 / (37 - r));
 };
 
 const totalVolume = (workout) =>
   workout.exercises.reduce((sum, ex) =>
-    sum + ex.sets.filter(s => s.completed).reduce((s, set) => s + (set.weight || 0) * (set.reps || 0), 0)
+    sum + ex.sets.filter(s => s.completed).reduce((s, set) => s + (Number(set.weight) || 0) * (Number(set.reps) || 0), 0)
   , 0);
+
+// Renser desimaltall-input mens brukeren skriver: bytter komma til punktum,
+// fjerner alt unntatt sifre og maks ett punktum. Returnerer strengen.
+function sanitizeDecimal(raw) {
+  if (raw === '' || raw == null) return '';
+  let s = String(raw).replace(',', '.').replace(/[^0-9.]/g, '');
+  const i = s.indexOf('.');
+  if (i !== -1) s = s.slice(0, i + 1) + s.slice(i + 1).replace(/\./g, '');
+  return s;
+}
 
 const completedSetCount = (workout) =>
   workout.exercises.reduce((n, ex) => n + ex.sets.filter(s => s.completed).length, 0);
+
+/* =========================================================
+   LYD, VARSLER OG WAKE-LOCK
+   =========================================================
+   Gir tilbakemelding når hviletimer går ut. Tre lag:
+   - Lyd: kort beep via Web Audio (krever app i foreground)
+   - Vibrasjon: navigator.vibrate (Android primært)
+   - Varsel: Notification API via service worker (best-effort på iOS)
+   - Wake Lock: holder skjermen på under hvile (valgfritt)
+*/
+
+let _audioCtx = null;
+function getAudioCtx() {
+  if (_audioCtx) return _audioCtx;
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return null;
+    _audioCtx = new Ctx();
+    return _audioCtx;
+  } catch { return null; }
+}
+
+// Spill to korte plinger (~250 ms totalt) når hvilen er ute.
+function playRestDoneSound() {
+  const ctx = getAudioCtx();
+  if (!ctx) return;
+  // iOS krever resume etter user-gesture
+  if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+  const now = ctx.currentTime;
+  const beep = (start, freq) => {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.0001, start);
+    gain.gain.exponentialRampToValueAtTime(0.25, start + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.18);
+    osc.connect(gain).connect(ctx.destination);
+    osc.start(start);
+    osc.stop(start + 0.2);
+  };
+  beep(now, 880);       // A5
+  beep(now + 0.13, 1175); // D6
+}
+
+// "Varm opp" lydsystemet ved første touch så iOS lar oss spille senere.
+function primeAudioOnce() {
+  const ctx = getAudioCtx();
+  if (!ctx) return;
+  if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+}
+
+async function requestNotificationPermission() {
+  if (!('Notification' in window)) return 'unsupported';
+  if (Notification.permission === 'granted') return 'granted';
+  if (Notification.permission === 'denied') return 'denied';
+  try {
+    const result = await Notification.requestPermission();
+    return result;
+  } catch { return 'denied'; }
+}
+
+async function showRestDoneNotification() {
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  const body = 'Hvilen er ferdig — neste sett venter.';
+  const opts = {
+    body,
+    icon: './icon-192.png',
+    badge: './icon-192.png',
+    tag: 'rest-done',
+    renotify: true,
+    silent: false,
+    vibrate: [200, 80, 200],
+  };
+  try {
+    const reg = await navigator.serviceWorker?.getRegistration();
+    if (reg) {
+      await reg.showNotification('Klar', opts);
+      return;
+    }
+  } catch {}
+  try { new Notification('Klar', opts); } catch {}
+}
+
+// Wake Lock: hold skjermen på til vi releaser. Returnerer release-funksjon.
+async function acquireWakeLock() {
+  if (!('wakeLock' in navigator)) return null;
+  try {
+    const sentinel = await navigator.wakeLock.request('screen');
+    return () => { try { sentinel.release(); } catch {} };
+  } catch { return null; }
+}
 
 /* =========================================================
    AUTH-STATE  (Supabase)
@@ -225,11 +332,11 @@ const cx = (...c) => c.filter(Boolean).join(' ');
 
 function Button({ children, onClick, variant = 'primary', size = 'md', disabled, className = '', type = 'button', ...rest }) {
   const variants = {
-    primary: 'bg-ink-900 text-white active:bg-ink-800',
-    secondary: 'bg-ink-100 text-ink-900 active:bg-ink-200',
+    primary: 'bg-accent text-accent-fg active:bg-accent-hover',
+    secondary: 'bg-ink-200 text-ink-900 active:bg-ink-300',
     ghost: 'bg-transparent text-ink-900 active:bg-ink-100',
     danger: 'bg-red-600 text-white active:bg-red-700',
-    outline: 'border border-ink-200 text-ink-900 active:bg-ink-50',
+    outline: 'border border-ink-300 text-ink-900 active:bg-ink-100',
   };
   const sizes = {
     sm: 'h-9 px-3 text-sm rounded-lg',
@@ -256,7 +363,7 @@ function IconButton({ children, onClick, className = '', ...rest }) {
 }
 
 function Card({ children, className = '', ...rest }) {
-  return html`<div class=${cx('rounded-2xl border border-ink-100 bg-white', className)} ...${rest}>${children}</div>`;
+  return html`<div class=${cx('rounded-2xl border border-ink-200 bg-ink-100 shadow-card', className)} ...${rest}>${children}</div>`;
 }
 
 function Modal({ open, onClose, title, children }) {
@@ -271,9 +378,9 @@ function Modal({ open, onClose, title, children }) {
   if (!open) return null;
   return html`
     <div class="fixed inset-0 z-50 modal-backdrop flex items-end sm:items-center justify-center" onClick=${onClose}>
-      <div class="w-full sm:max-w-md bg-white rounded-t-3xl sm:rounded-3xl max-h-[88vh] overflow-y-auto safe-bottom" onClick=${(e) => e.stopPropagation()}>
+      <div class="w-full sm:max-w-md bg-ink-100 rounded-t-3xl sm:rounded-3xl max-h-[88vh] overflow-y-auto safe-bottom border border-ink-200" onClick=${(e) => e.stopPropagation()}>
         ${title && html`
-          <div class="sticky top-0 bg-white px-5 pt-4 pb-3 border-b border-ink-100 flex items-center justify-between">
+          <div class="sticky top-0 bg-ink-100 px-5 pt-4 pb-3 border-b border-ink-200 flex items-center justify-between">
             <h2 class="text-lg font-semibold">${title}</h2>
             <${IconButton} onClick=${onClose}>
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
@@ -304,7 +411,7 @@ function Input({ value, onInput, placeholder, type = 'text', className = '', inp
       value=${value ?? ''}
       onInput=${(e) => onInput?.(e.currentTarget.value)}
       placeholder=${placeholder}
-      class=${cx('w-full h-11 px-3 rounded-xl bg-ink-50 border border-transparent focus:border-ink-300 focus:bg-white outline-none text-base', className)}
+      class=${cx('w-full h-11 px-3 rounded-xl bg-ink-50 border border-transparent focus:border-ink-300 focus:bg-ink-200 outline-none text-base', className)}
       ...${rest}
     />
   `;
@@ -315,7 +422,7 @@ function Select({ value, onChange, options, className = '' }) {
     <select
       value=${value}
       onChange=${(e) => onChange?.(e.currentTarget.value)}
-      class=${cx('w-full h-11 px-3 rounded-xl bg-ink-50 border border-transparent focus:border-ink-300 focus:bg-white outline-none text-base appearance-none', className)}
+      class=${cx('w-full h-11 px-3 rounded-xl bg-ink-50 border border-transparent focus:border-ink-300 focus:bg-ink-200 outline-none text-base appearance-none', className)}
     >
       ${options.map(o => html`<option value=${typeof o === 'string' ? o : o.value}>${typeof o === 'string' ? o : o.label}</option>`)}
     </select>
@@ -409,15 +516,15 @@ function HomeScreen({ data, update, navigate }) {
 
       ${data.activeWorkout && html`
         <div class="px-5 mb-5">
-          <${Card} className="p-5 bg-ink-900 text-white border-ink-900">
+          <${Card} className="p-5 bg-accent text-accent-fg border-accent">
             <div class="flex items-center justify-between mb-3">
               <div>
-                <div class="text-xs text-ink-300 uppercase tracking-wide">Pågående økt</div>
-                <div class="text-lg font-semibold">${data.activeWorkout.name || 'Uten navn'}</div>
+                <div class="text-xs text-accent-fg/70 uppercase tracking-wide font-semibold">Pågående økt</div>
+                <div class="text-lg font-bold">${data.activeWorkout.name || 'Uten navn'}</div>
               </div>
               <${LiveTimer} since=${data.activeWorkout.startedAt} />
             </div>
-            <${Button} variant="secondary" className="w-full !bg-white !text-ink-900" onClick=${() => navigate('logg')}>
+            <${Button} variant="secondary" className="w-full !bg-accent-fg !text-accent active:!bg-ink-50" onClick=${() => navigate('logg')}>
               Fortsett økt →
             <//>
           <//>
@@ -447,7 +554,7 @@ function HomeScreen({ data, update, navigate }) {
               <div class=${cx('flex flex-col items-center py-2 rounded-xl', isToday ? 'bg-ink-50' : '')}>
                 <div class="text-[10px] uppercase text-ink-400 mb-1">${['S','M','T','O','T','F','L'][d.getDay()]}</div>
                 <div class=${cx('text-sm font-medium', isToday ? 'text-ink-900' : 'text-ink-600')}>${d.getDate()}</div>
-                <div class=${cx('w-1.5 h-1.5 rounded-full mt-1.5', workout ? 'bg-ink-900' : 'bg-ink-200')}></div>
+                <div class=${cx('w-1.5 h-1.5 rounded-full mt-1.5', workout ? 'bg-accent' : 'bg-ink-300')}></div>
               </div>
             `;
           })}
@@ -685,11 +792,11 @@ function WorkoutScreen({ data, update, navigate }) {
           value=${aw.name}
           onInput=${(e) => setName(e.currentTarget.value)}
           placeholder="Navn på økta (valgfritt)"
-          class="w-full text-2xl font-semibold tracking-tight bg-transparent outline-none placeholder:text-ink-300"
+          class="w-full text-2xl font-semibold tracking-tight bg-transparent outline-none placeholder:text-ink-400"
         />
       </div>
 
-      ${restTimer && html`<${RestBanner} endsAt=${restTimer.endsAt} total=${restTimer.total} onDone=${() => setRestTimer(null)} onCancel=${() => setRestTimer(null)} />`}
+      ${restTimer && html`<${RestBanner} endsAt=${restTimer.endsAt} total=${restTimer.total} settings=${data.settings} onDone=${() => setRestTimer(null)} onCancel=${() => setRestTimer(null)} />`}
 
       <div class="px-5 space-y-4">
         ${aw.exercises.map((ex, exIdx) => {
@@ -847,30 +954,30 @@ function SetRow({ num, set, previousSet, showRPE, onChange, onComplete, onPickRe
       <div class="col-span-1 text-sm text-ink-500 text-center">${num}</div>
       <div class=${showRPE ? 'col-span-3' : 'col-span-4'}>
         <input
-          type="number" inputMode="decimal" step="any"
+          type="text" inputMode="decimal"
           value=${set.weight}
           placeholder=${prevWeight !== '' ? String(prevWeight) : ''}
-          onInput=${(e) => onChange({ weight: e.currentTarget.value === '' ? '' : parseFloat(e.currentTarget.value) })}
-          class="w-full h-10 px-2 text-center bg-ink-50 rounded-lg outline-none focus:bg-white focus:ring-1 focus:ring-ink-300 big-num placeholder:text-ink-300 placeholder:font-normal"
+          onInput=${(e) => onChange({ weight: sanitizeDecimal(e.currentTarget.value) })}
+          class="w-full h-10 px-2 text-center bg-ink-50 rounded-lg outline-none focus:bg-ink-200 focus:ring-1 focus:ring-ink-300 big-num placeholder:text-ink-400 placeholder:font-normal"
         />
       </div>
       <div class="col-span-3">
         <input
-          type="number" inputMode="numeric"
+          type="text" inputMode="decimal"
           value=${set.reps}
           placeholder=${prevReps !== '' ? String(prevReps) : ''}
-          onInput=${(e) => onChange({ reps: e.currentTarget.value === '' ? '' : parseInt(e.currentTarget.value) })}
-          class="w-full h-10 px-2 text-center bg-ink-50 rounded-lg outline-none focus:bg-white focus:ring-1 focus:ring-ink-300 big-num placeholder:text-ink-300 placeholder:font-normal"
+          onInput=${(e) => onChange({ reps: sanitizeDecimal(e.currentTarget.value) })}
+          class="w-full h-10 px-2 text-center bg-ink-50 rounded-lg outline-none focus:bg-ink-200 focus:ring-1 focus:ring-ink-300 big-num placeholder:text-ink-400 placeholder:font-normal"
         />
       </div>
       ${showRPE && html`
         <div class="col-span-2">
           <input
-            type="number" inputMode="decimal" step="0.5" min="1" max="10"
+            type="text" inputMode="decimal"
             value=${set.rpe}
             placeholder=${prevRpe !== '' ? String(prevRpe) : ''}
-            onInput=${(e) => onChange({ rpe: e.currentTarget.value === '' ? '' : parseFloat(e.currentTarget.value) })}
-            class="w-full h-10 px-2 text-center bg-ink-50 rounded-lg outline-none focus:bg-white focus:ring-1 focus:ring-ink-300 big-num placeholder:text-ink-300 placeholder:font-normal"
+            onInput=${(e) => onChange({ rpe: sanitizeDecimal(e.currentTarget.value) })}
+            class="w-full h-10 px-2 text-center bg-ink-50 rounded-lg outline-none focus:bg-ink-200 focus:ring-1 focus:ring-ink-300 big-num placeholder:text-ink-400 placeholder:font-normal"
           />
         </div>
       `}
@@ -887,7 +994,7 @@ function SetRow({ num, set, previousSet, showRPE, onChange, onComplete, onPickRe
         <button
           onClick=${onComplete}
           aria-label=${set.completed ? 'Angre fullført' : 'Fullfør sett og start hvile'}
-          class=${cx('tap w-9 h-9 rounded-lg flex items-center justify-center', set.completed ? 'bg-ink-900 text-white' : 'bg-ink-100 text-ink-500 active:bg-ink-200')}
+          class=${cx('tap w-9 h-9 rounded-lg flex items-center justify-center', set.completed ? 'bg-accent text-accent-fg' : 'bg-ink-100 text-ink-500 active:bg-ink-200')}
         >
           <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <circle cx="12" cy="13" r="8"/>
@@ -920,33 +1027,61 @@ function RestPickerModal({ open, onClose, onPick }) {
   `;
 }
 
-function RestBanner({ endsAt, total, onDone, onCancel }) {
+function RestBanner({ endsAt, total, settings, onDone, onCancel }) {
   const [now, setNow] = useState(Date.now());
+  const wakeLockRelease = useRef(null);
+  const firedRef = useRef(false);
+
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), 250);
     return () => clearInterval(id);
   }, []);
+
+  // Acquire wake lock når timeren starter, hvis aktivert
+  useEffect(() => {
+    let released = false;
+    if (settings?.wakeLockEnabled) {
+      acquireWakeLock().then((rel) => {
+        if (released) { rel?.(); return; }
+        wakeLockRelease.current = rel;
+      });
+    }
+    return () => {
+      released = true;
+      wakeLockRelease.current?.();
+      wakeLockRelease.current = null;
+    };
+  }, [settings?.wakeLockEnabled]);
+
   const remaining = Math.max(0, Math.ceil((endsAt - now) / 1000));
   const pct = total ? Math.max(0, Math.min(100, ((total - remaining) / total) * 100)) : 0;
+
   useEffect(() => {
-    if (remaining === 0) {
+    if (remaining === 0 && !firedRef.current) {
+      firedRef.current = true;
       try { navigator.vibrate?.([200, 80, 200]); } catch {}
+      if (settings?.soundEnabled !== false) playRestDoneSound();
+      if (settings?.notificationsEnabled) showRestDoneNotification();
+      wakeLockRelease.current?.();
+      wakeLockRelease.current = null;
       onDone();
     }
   }, [remaining]);
   const fmt = (s) => s < 60 ? `${s}s` : `${Math.floor(s/60)}:${(s%60).toString().padStart(2,'0')}`;
   return html`
-    <div class="sticky top-2 z-10 mx-5 mb-4 rounded-2xl bg-ink-900 text-white px-4 py-3 overflow-hidden">
-      <div class="flex items-center justify-between">
-        <div>
-          <div class="text-xs text-ink-300 uppercase tracking-wide">Hvil</div>
-          <div class="big-num text-2xl font-semibold tabular-nums">${fmt(remaining)}</div>
+    <div class="fixed left-0 right-0 z-20 px-5 above-bottom-nav pointer-events-none">
+      <div class="rounded-2xl bg-accent text-accent-fg px-4 py-3 overflow-hidden shadow-lg pointer-events-auto relative">
+        <div class="flex items-center justify-between">
+          <div>
+            <div class="text-xs text-accent-fg/70 uppercase tracking-wide font-semibold">Hvil</div>
+            <div class="big-num text-2xl font-bold tabular-nums">${fmt(remaining)}</div>
+          </div>
+          <button onClick=${onCancel} class="tap text-sm font-medium text-accent-fg/80 px-3 py-1 active:text-accent-fg">Hopp over</button>
         </div>
-        <button onClick=${onCancel} class="tap text-sm text-ink-300 px-3 py-1">Hopp over</button>
+        ${total && html`
+          <div class="absolute left-0 bottom-0 h-1 bg-accent-fg/40 transition-all" style=${`width:${pct}%`}></div>
+        `}
       </div>
-      ${total && html`
-        <div class="absolute left-0 bottom-0 h-1 bg-white/40 transition-all" style=${`width:${pct}%`}></div>
-      `}
     </div>
   `;
 }
@@ -1014,13 +1149,13 @@ function ExercisePicker({ open, exercises, onClose, onPick, onCreateNew }) {
             <div class="max-h-[50vh] overflow-y-auto -mx-5 px-5">
               ${Object.keys(grouped).sort().map(mg => html`
                 <div class="mb-4">
-                  <div class="text-[10px] uppercase tracking-wider text-ink-400 mb-1.5 sticky top-0 bg-white py-1">${mg}</div>
+                  <div class="text-[10px] uppercase tracking-wider text-ink-400 mb-1.5 sticky top-0 bg-ink-100 py-1">${mg}</div>
                   <div class="space-y-1">
                     ${grouped[mg].map(e => html`
                       <button
                         onClick=${() => toggle(e.id)}
                         class=${cx('tap w-full flex items-center justify-between p-3 rounded-xl text-left',
-                          selected.includes(e.id) ? 'bg-ink-900 text-white' : 'bg-ink-50 active:bg-ink-100')}
+                          selected.includes(e.id) ? 'bg-accent text-accent-fg' : 'bg-ink-50 active:bg-ink-100')}
                       >
                         <span class="font-medium">${e.name}</span>
                         ${selected.includes(e.id) && html`
@@ -1034,7 +1169,7 @@ function ExercisePicker({ open, exercises, onClose, onPick, onCreateNew }) {
             </div>
           `}
 
-          <div class="flex gap-2 pt-2 border-t border-ink-100 -mx-5 px-5">
+          <div class="flex gap-2 pt-2 border-t border-ink-200 -mx-5 px-5">
             <${Button} variant="secondary" className="flex-1" onClick=${() => setCreating(true)}>+ Ny øvelse<//>
             <${Button} className="flex-1" onClick=${() => onPick(selected)} disabled=${selected.length === 0}>
               Legg til ${selected.length > 0 ? `(${selected.length})` : ''}
@@ -1097,7 +1232,7 @@ function ExercisesScreen({ data, update }) {
           <button
             onClick=${() => setFilter(mg)}
             class=${cx('tap shrink-0 px-3 h-8 rounded-full text-sm capitalize',
-              filter === mg ? 'bg-ink-900 text-white' : 'bg-ink-100 text-ink-700')}
+              filter === mg ? 'bg-accent text-accent-fg' : 'bg-ink-100 text-ink-700')}
           >${mg}</button>
         `)}
       </div>
@@ -1118,7 +1253,7 @@ function ExercisesScreen({ data, update }) {
                   <div class="font-medium">${e.name}</div>
                   <div class="text-xs text-ink-400">${e.muscleGroup}</div>
                 </div>
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" class="text-ink-300"><path d="m9 6 6 6-6 6"/></svg>
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" class="text-ink-400"><path d="m9 6 6 6-6 6"/></svg>
               <//>
             </button>
           `)}
@@ -1164,7 +1299,7 @@ function ExerciseEditor({ editing, onClose, onSave, onDelete }) {
             onInput=${(e) => setNotes(e.currentTarget.value)}
             placeholder="Form-tips, utstyr, osv."
             rows="3"
-            class="w-full p-3 rounded-xl bg-ink-50 outline-none focus:bg-white focus:ring-1 focus:ring-ink-300 resize-none"
+            class="w-full p-3 rounded-xl bg-ink-50 outline-none focus:bg-ink-200 focus:ring-1 focus:ring-ink-300 resize-none"
           ></textarea>
         <//>
         <div class="flex gap-2 pt-3">
@@ -1289,7 +1424,7 @@ function ProgramEditor({ editing, exercises, onClose, onSave, onDelete, onCreate
 
         <div class="space-y-3">
           ${program.days.map((day, di) => html`
-            <div class="rounded-xl border border-ink-100 p-3">
+            <div class="rounded-xl border border-ink-200 p-3">
               <div class="flex items-center gap-2 mb-2">
                 <input
                   value=${day.name}
@@ -1310,7 +1445,7 @@ function ProgramEditor({ editing, exercises, onClose, onSave, onDelete, onCreate
                         type="number" inputMode="numeric"
                         value=${ex.targetSets}
                         onInput=${(e) => updateExerciseInDay(di, exIdx, { targetSets: parseInt(e.currentTarget.value) || 3 })}
-                        class="w-12 h-8 px-2 bg-white rounded text-sm text-center"
+                        class="w-12 h-8 px-2 bg-ink-200 text-ink-900 rounded text-sm text-center outline-none focus:ring-1 focus:ring-ink-300"
                         title="Antall sett"
                       />
                       <span class="text-xs text-ink-400">×</span>
@@ -1318,7 +1453,7 @@ function ProgramEditor({ editing, exercises, onClose, onSave, onDelete, onCreate
                         value=${ex.targetReps || ''}
                         onInput=${(e) => updateExerciseInDay(di, exIdx, { targetReps: e.currentTarget.value })}
                         placeholder="8-12"
-                        class="w-16 h-8 px-2 bg-white rounded text-sm text-center"
+                        class="w-16 h-8 px-2 bg-ink-200 text-ink-900 rounded text-sm text-center outline-none focus:ring-1 focus:ring-ink-300"
                         title="Reps"
                       />
                       <button onClick=${() => removeExerciseFromDay(di, exIdx)} class="tap text-ink-400 text-sm">×</button>
@@ -1375,7 +1510,7 @@ function StatsScreen({ data, navigate }) {
           <button
             onClick=${() => setTab(k)}
             class=${cx('tap flex-1 h-9 rounded-lg text-sm font-medium',
-              tab === k ? 'bg-white text-ink-900 shadow-sm' : 'text-ink-500')}
+              tab === k ? 'bg-ink-200 text-ink-900 shadow-sm' : 'text-ink-500')}
           >${l}</button>
         `)}
       </div>
@@ -1418,7 +1553,7 @@ function OverviewTab({ data, stats }) {
               <div class="flex-1 flex flex-col items-center gap-1">
                 <div class="w-full flex items-end h-24">
                   <div
-                    class="w-full bg-ink-900 rounded-t-md transition-all"
+                    class="w-full bg-accent rounded-t-md transition-all"
                     style=${`height: ${(w.volume / max) * 100}%; min-height: ${w.volume > 0 ? 4 : 0}px;`}
                   ></div>
                 </div>
@@ -1549,9 +1684,9 @@ function LineChart({ points, units }) {
 
   return html`
     <svg viewBox=${`0 0 ${W} ${H}`} class="w-full h-auto">
-      <line x1=${P} y1=${H - P} x2=${W - P} y2=${H - P} stroke="#e4e4e7" stroke-width="1" />
-      <path d=${path} fill="none" stroke="#0a0a0a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
-      ${points.map(p => html`<circle cx=${xScale(p.date)} cy=${yScale(p.value)} r="3" fill="#0a0a0a" />`)}
+      <line x1=${P} y1=${H - P} x2=${W - P} y2=${H - P} stroke="#3f3f48" stroke-width="1" />
+      <path d=${path} fill="none" stroke="#a3e635" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+      ${points.map(p => html`<circle cx=${xScale(p.date)} cy=${yScale(p.value)} r="3" fill="#a3e635" />`)}
       <text x=${P} y=${H - 6} font-size="10" fill="#a1a1aa">${fmtDate(xMin)}</text>
       <text x=${W - P} y=${H - 6} font-size="10" fill="#a1a1aa" text-anchor="end">${fmtDate(xMax)}</text>
       <text x=${W - P} y="14" font-size="10" fill="#a1a1aa" text-anchor="end">${Math.round(yMax)} ${units}</text>
@@ -1666,7 +1801,7 @@ function SettingsScreen({ data, update, setRawData, user, signOut }) {
                 <button
                   onClick=${() => setSettings({ units: u })}
                   class=${cx('tap flex-1 h-9 rounded-lg text-sm font-medium uppercase',
-                    data.settings.units === u ? 'bg-white shadow-sm' : 'text-ink-500')}
+                    data.settings.units === u ? 'bg-ink-200 text-ink-900 shadow-sm' : 'text-ink-500')}
                 >${u}</button>
               `)}
             </div>
@@ -1680,7 +1815,55 @@ function SettingsScreen({ data, update, setRawData, user, signOut }) {
                 <button
                   onClick=${() => setSettings({ showRPE: v })}
                   class=${cx('tap flex-1 h-9 rounded-lg text-sm font-medium',
-                    data.settings.showRPE === v ? 'bg-white shadow-sm' : 'text-ink-500')}
+                    data.settings.showRPE === v ? 'bg-ink-200 text-ink-900 shadow-sm' : 'text-ink-500')}
+                >${l}</button>
+              `)}
+            </div>
+          <//>
+        <//>
+
+        <${Card} className="p-4 space-y-3">
+          <div class="text-xs uppercase tracking-wide text-ink-400 font-medium">Hviletimer</div>
+          <${Field} label="Lyd når hvilen er ute" hint="Kort beep — krever at appen er åpen.">
+            <div class="flex gap-1 bg-ink-100 rounded-xl p-1">
+              ${[[true, 'På'], [false, 'Av']].map(([v, l]) => html`
+                <button
+                  onClick=${() => { setSettings({ soundEnabled: v }); if (v) { primeAudioOnce(); playRestDoneSound(); } }}
+                  class=${cx('tap flex-1 h-9 rounded-lg text-sm font-medium',
+                    data.settings.soundEnabled === v ? 'bg-ink-200 text-ink-900 shadow-sm' : 'text-ink-500')}
+                >${l}</button>
+              `)}
+            </div>
+          <//>
+          <${Field} label="Varsel når hvilen er ute" hint="Funker best når appen er installert på hjem-skjerm. iOS låser tidsstyrt JavaScript når telefonen er låst — så varsler er pålitelige kun når appen nylig var aktiv.">
+            <div class="flex gap-1 bg-ink-100 rounded-xl p-1">
+              ${[[true, 'På'], [false, 'Av']].map(([v, l]) => html`
+                <button
+                  onClick=${async () => {
+                    if (v) {
+                      const perm = await requestNotificationPermission();
+                      if (perm !== 'granted') {
+                        alert(perm === 'denied'
+                          ? 'Varsler er blokkert. Gå til innstillinger i nettleseren for å gi tillatelse.'
+                          : 'Varsler støttes ikke i denne nettleseren.');
+                        return;
+                      }
+                    }
+                    setSettings({ notificationsEnabled: v });
+                  }}
+                  class=${cx('tap flex-1 h-9 rounded-lg text-sm font-medium',
+                    data.settings.notificationsEnabled === v ? 'bg-ink-200 text-ink-900 shadow-sm' : 'text-ink-500')}
+                >${l}</button>
+              `)}
+            </div>
+          <//>
+          <${Field} label="Hold skjerm våken under hvile" hint="Bruker mer batteri, men gjør at lyd og timer alltid funker.">
+            <div class="flex gap-1 bg-ink-100 rounded-xl p-1">
+              ${[[true, 'På'], [false, 'Av']].map(([v, l]) => html`
+                <button
+                  onClick=${() => setSettings({ wakeLockEnabled: v })}
+                  class=${cx('tap flex-1 h-9 rounded-lg text-sm font-medium',
+                    data.settings.wakeLockEnabled === v ? 'bg-ink-200 text-ink-900 shadow-sm' : 'text-ink-500')}
                 >${l}</button>
               `)}
             </div>
@@ -1690,8 +1873,14 @@ function SettingsScreen({ data, update, setRawData, user, signOut }) {
         <${Card} className="p-4">
           <div class="text-xs uppercase tracking-wide text-ink-400 font-medium mb-3">Data</div>
           <div class="space-y-2">
-            <${Button} variant="secondary" className="w-full" onClick=${exportData}>📥 Eksporter til fil (.json)<//>
-            <${Button} variant="secondary" className="w-full" onClick=${() => fileInput.current?.click()}>📤 Importer fra fil<//>
+            <${Button} variant="secondary" className="w-full" onClick=${exportData}>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              Eksporter til fil (.json)
+            <//>
+            <${Button} variant="secondary" className="w-full" onClick=${() => fileInput.current?.click()}>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+              Importer fra fil
+            <//>
             <input
               ref=${fileInput}
               type="file"
@@ -1750,7 +1939,7 @@ const TABS = [
 
 function BottomNav({ current, onChange }) {
   return html`
-    <nav class="fixed bottom-0 inset-x-0 bg-white/95 backdrop-blur border-t border-ink-100 safe-bottom z-30">
+    <nav class="fixed bottom-0 inset-x-0 bg-ink-50/95 backdrop-blur border-t border-ink-200 safe-bottom z-30">
       <div class="grid grid-cols-5 max-w-md mx-auto">
         ${TABS.map(t => html`
           <button
@@ -1842,13 +2031,13 @@ function LoginScreen() {
             type="button"
             onClick=${() => switchMode('signin')}
             class=${cx('tap flex-1 h-10 rounded-lg text-sm font-medium',
-              mode === 'signin' ? 'bg-white shadow-sm' : 'text-ink-500')}
+              mode === 'signin' ? 'bg-ink-200 text-ink-900 shadow-sm' : 'text-ink-500')}
           >Logg inn</button>
           <button
             type="button"
             onClick=${() => switchMode('signup')}
             class=${cx('tap flex-1 h-10 rounded-lg text-sm font-medium',
-              mode === 'signup' ? 'bg-white shadow-sm' : 'text-ink-500')}
+              mode === 'signup' ? 'bg-ink-200 text-ink-900 shadow-sm' : 'text-ink-500')}
           >Lag konto</button>
         </div>
 
@@ -1861,7 +2050,7 @@ function LoginScreen() {
               value=${email}
               onInput=${(e) => setEmail(e.currentTarget.value)}
               placeholder="din@epost.no"
-              class="w-full h-12 px-4 bg-ink-50 rounded-xl outline-none focus:bg-white focus:ring-1 focus:ring-ink-300"
+              class="w-full h-12 px-4 bg-ink-50 rounded-xl outline-none focus:bg-ink-200 focus:ring-1 focus:ring-ink-300"
               required
             />
           <//>
@@ -1872,7 +2061,7 @@ function LoginScreen() {
               value=${password}
               onInput=${(e) => setPassword(e.currentTarget.value)}
               placeholder=${mode === 'signin' ? 'Ditt passord' : 'Velg et passord'}
-              class="w-full h-12 px-4 bg-ink-50 rounded-xl outline-none focus:bg-white focus:ring-1 focus:ring-ink-300"
+              class="w-full h-12 px-4 bg-ink-50 rounded-xl outline-none focus:bg-ink-200 focus:ring-1 focus:ring-ink-300"
               required
               minlength="6"
             />
@@ -1882,7 +2071,7 @@ function LoginScreen() {
           <//>
         </form>
 
-        ${error && html`<div class="mt-4 p-3 rounded-lg bg-red-50 text-red-700 text-sm">${error}</div>`}
+        ${error && html`<div class="mt-4 p-3 rounded-lg bg-red-950/40 border border-red-800 text-red-300 text-sm">${error}</div>`}
         ${info && !error && html`<div class="mt-4 p-3 rounded-lg bg-ink-50 text-ink-600 text-sm">${info}</div>`}
 
         <p class="mt-8 text-xs text-ink-400 text-center">
@@ -1904,6 +2093,20 @@ function App() {
   const [data, update, setRawData, synced] = useStore(user);
   const [route, setRoute] = useState({ name: 'hjem', params: {} });
   const navigate = (name, params = {}) => setRoute({ name, params });
+
+  // Vekk Web Audio på første brukerklikk (iOS krever user-gesture)
+  useEffect(() => {
+    const handler = () => { primeAudioOnce(); };
+    window.addEventListener('pointerdown', handler, { once: true, passive: true });
+    return () => window.removeEventListener('pointerdown', handler);
+  }, []);
+
+  // Forsøk å låse orientering til portrait når appen er fullskjerm-PWA
+  useEffect(() => {
+    try {
+      screen.orientation?.lock?.('portrait').catch(() => {});
+    } catch {}
+  }, []);
 
   // Splash mens auth-status sjekkes
   if (loading) {
